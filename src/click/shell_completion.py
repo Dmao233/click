@@ -361,9 +361,29 @@ class ShellComplete:
         :param args: List of complete args before the incomplete value.
         :param incomplete: Value being completed. May be empty.
         """
+        # Copy so the caller's list is left unchanged. ``_resolve_incomplete``
+        # appends an option name when the incomplete word is ``--opt=value``.
+        args = list(args)
+        _pop_bash_option_equals(args)
         ctx = _resolve_context(self.cli, self.ctx_args, self.prog_name, args)
-        obj, incomplete = _resolve_incomplete(ctx, args, incomplete)
-        return obj.shell_complete(ctx, incomplete)
+        obj, incomplete, prefix = _resolve_incomplete(ctx, args, incomplete)
+        completions = obj.shell_complete(ctx, incomplete)
+
+        # Zsh replaces the whole "--color=al" word. Rebuild items so a cached
+        # CompletionItem is not rewritten, and so type, help, and extra
+        # metadata stay on the suggestion.
+        if prefix:
+            completions = [
+                CompletionItem(
+                    f"{prefix}{item.value}",
+                    type=item.type,
+                    help=item.help,
+                    **item._info,
+                )
+                for item in completions
+            ]
+
+        return completions
 
     def format_completion(self, item: CompletionItem[str]) -> str:
         """Format a completion item into the form recognized by the
@@ -668,6 +688,25 @@ def _start_of_option(ctx: Context, value: str) -> bool:
     return c in ctx._opt_prefixes
 
 
+def _pop_bash_option_equals(args: list[str]) -> None:
+    """Drop a trailing ``=`` word Bash inserts before an option value.
+
+    Bash treats ``=`` as a completion word break, so ``--color=al`` arrives
+    as the complete words ``--color``, ``=`` and the incomplete word ``al``.
+    The ``=`` is not the option value. ``-`` and ``--`` are not options
+    waiting for a value, so a trailing ``=`` after those is left alone.
+    """
+    if len(args) < 2 or args[-1] != "=":
+        return
+
+    previous = args[-2]
+
+    if not previous.startswith("-") or previous in {"-", "--"}:
+        return
+
+    args.pop()
+
+
 def _is_incomplete_option(ctx: Context, args: list[str], param: Parameter) -> bool:
     """Determine if the given parameter is an option that needs a value.
 
@@ -756,9 +795,15 @@ def _resolve_context(
 
 def _resolve_incomplete(
     ctx: Context, args: list[str], incomplete: str
-) -> tuple[Command | Parameter, str]:
+) -> tuple[Command | Parameter, str, str]:
     """Find the Click object that will handle the completion of the
-    incomplete value. Return the object and the incomplete value.
+    incomplete value. Return the object, the incomplete value, and a
+    prefix to put back on each completion.
+
+    The prefix is set when the incomplete word itself is ``option=value``.
+    Shells that keep that as one word replace the whole word, so the
+    completion has to include the option name. Bash's split form is handled
+    by :func:`_pop_bash_option_equals` and uses an empty prefix.
 
     :param ctx: Invocation context for the command represented by
         the parsed complete args.
@@ -768,19 +813,24 @@ def _resolve_incomplete(
     # Different shells treat an "=" between a long option name and
     # value differently. Might keep the value joined, return the "="
     # as a separate item, or return the split name and value. Always
-    # split and discard the "=" to make completion easier.
+    # split and discard the "=" to make completion easier. When the
+    # joined form is split here, remember the option so the suggestion
+    # can be reassembled as ``--color=always``.
+    prefix = ""
+
     if incomplete == "=":
         incomplete = ""
     elif "=" in incomplete and _start_of_option(ctx, incomplete):
         name, _, incomplete = incomplete.partition("=")
         args.append(name)
+        prefix = f"{name}="
 
     # The "--" marker tells Click to stop treating values as options
     # even if they start with the option character. If it hasn't been
     # given and the incomplete arg looks like an option, the current
     # command will provide option name completions.
     if "--" not in args and _start_of_option(ctx, incomplete):
-        return ctx.command, incomplete
+        return ctx.command, incomplete, ""
 
     params = ctx.command.get_params(ctx)
 
@@ -788,14 +838,14 @@ def _resolve_incomplete(
     # value, the option will provide value completions.
     for param in params:
         if _is_incomplete_option(ctx, args, param):
-            return param, incomplete
+            return param, incomplete, prefix
 
     # It's not an option name or value. The first argument without a
     # parsed value will provide value completions.
     for param in params:
         if _is_incomplete_argument(ctx, param):
-            return param, incomplete
+            return param, incomplete, ""
 
     # There were no unparsed arguments, the command may be a group that
     # will provide command name completions.
-    return ctx.command, incomplete
+    return ctx.command, incomplete, ""

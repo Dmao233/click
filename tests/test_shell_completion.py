@@ -150,6 +150,56 @@ def test_type_choice():
     assert _get_words(cli, ["-c"], "a2") == ["a2"]
 
 
+def _color_choice_cli():
+    return Command(
+        "cli",
+        params=[Option(["--color"], type=Choice(["auto", "always", "never"]))],
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "incomplete", "expect"),
+    [
+        # Zsh keeps "--long-option=value" as the incomplete word. The shell
+        # replaces that whole word, so the option name has to stay on the item.
+        ([], "--color=", ["--color=auto", "--color=always", "--color=never"]),
+        ([], "--color=a", ["--color=auto", "--color=always"]),
+        ([], "--color=al", ["--color=always"]),
+        # Bash word-breaks on "=". The current word is only the value, and the
+        # "=" is a separate complete word (or the incomplete word, if the
+        # cursor is still on the break).
+        (["--color"], "=", ["auto", "always", "never"]),
+        (["--color", "="], "", ["auto", "always", "never"]),
+        (["--color", "="], "a", ["auto", "always"]),
+        (["--color", "="], "al", ["always"]),
+        # A space still completes the value without rewriting the option.
+        (["--color"], "", ["auto", "always", "never"]),
+        (["--color"], "a", ["auto", "always"]),
+        (["--color"], "al", ["always"]),
+    ],
+)
+def test_long_option_equals_value(args, incomplete, expect):
+    assert _get_words(_color_choice_cli(), args, incomplete) == expect
+
+
+def test_long_option_equals_keeps_completion_metadata():
+    def custom(ctx, param, incomplete):
+        return [CompletionItem(f"{incomplete}z", help="hint", extra=1)]
+
+    cli = Command(
+        "cli",
+        add_help_option=False,
+        params=[Option(["--color"], shell_complete=custom)],
+    )
+    items = _get_completions(cli, [], "--color=a")
+    assert len(items) == 1
+    item = items[0]
+    assert item.value == "--color=az"
+    assert item.help == "hint"
+    assert item.type == "plain"
+    assert item.extra == 1
+
+
 def test_choice_special_characters():
     cli = Command("cli", params=[Option(["-c"], type=Choice(["!1", "!2", "+3"]))])
     assert _get_words(cli, ["-c"], "") == ["!1", "!2", "+3"]
@@ -386,6 +436,55 @@ def test_full_source_powershell(runner):
 @pytest.mark.usefixtures("_patch_for_completion")
 def test_full_complete(runner, shell, env, expect):
     cli = Group("cli", commands=[Command("a"), Command("b", help="bee")])
+    env["_CLI_COMPLETE"] = f"{shell}_complete"
+    result = runner.invoke(cli, env=env)
+    assert result.output == expect
+
+
+@pytest.mark.parametrize(
+    ("shell", "env", "expect"),
+    [
+        (
+            "bash",
+            {"COMP_WORDS": "cli --color =", "COMP_CWORD": "2"},
+            "plain,auto\nplain,always\nplain,never\n",
+        ),
+        (
+            "bash",
+            {"COMP_WORDS": "cli --color = a", "COMP_CWORD": "3"},
+            "plain,auto\nplain,always\n",
+        ),
+        (
+            "bash",
+            {"COMP_WORDS": "cli --color = al", "COMP_CWORD": "3"},
+            "plain,always\n",
+        ),
+        (
+            "zsh",
+            {"COMP_WORDS": "cli --color=", "COMP_CWORD": "1"},
+            "plain\n--color=auto\n_\nplain\n--color=always\n_\nplain\n--color=never\n_\n",
+        ),
+        (
+            "zsh",
+            {"COMP_WORDS": "cli --color=a", "COMP_CWORD": "1"},
+            "plain\n--color=auto\n_\nplain\n--color=always\n_\n",
+        ),
+        (
+            "zsh",
+            {"COMP_WORDS": "cli --color=al", "COMP_CWORD": "1"},
+            "plain\n--color=always\n_\n",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("_patch_for_completion")
+def test_long_option_equals_shell_complete(runner, shell, env, expect):
+    """``--color=``, ``--color=a``, and ``--color=al`` through Bash and Zsh.
+
+    Bash's completion script forwards ``=`` as its own ``COMP_WORDS`` entry.
+    Zsh forwards the whole ``--color=...`` token. See issue 2847.
+    """
+    cli = _color_choice_cli()
+    env = dict(env)
     env["_CLI_COMPLETE"] = f"{shell}_complete"
     result = runner.invoke(cli, env=env)
     assert result.output == expect
